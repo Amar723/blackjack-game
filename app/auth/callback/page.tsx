@@ -1,78 +1,52 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
-import LoadingSpinner from "@/components/LoadingSpinner";
 
 export default function AuthCallback() {
   const router = useRouter();
-  const ranRef = useRef(false);
+
+  const url = useMemo(() => {
+    if (typeof window === "undefined") return "";
+    return window.location.href;
+  }, []);
 
   useEffect(() => {
     const run = async () => {
-      if (ranRef.current) return;
-      ranRef.current = true;
-
       try {
-        // The auth state change will be automatically handled by Supabase
-        // We just need to wait a moment for the session to be set, then check for user
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-
-        const {
-          data: { user },
-          error: userErr,
-        } = await supabase.auth.getUser();
-
-        if (userErr || !user) {
-          console.error("Auth callback getUser error:", userErr?.message);
-          router.replace("/signin?error=no_user");
+        // Basic guard: do we even have a ?code= param?
+        const u = new URL(url);
+        const hasCode = !!u.searchParams.get("code");
+        if (!hasCode) {
+          // User hit this route directly or wrong redirect URL
+          router.replace("/signin?error=missing_code");
           return;
         }
 
-        // Ensure a profile row exists (id, email, chips)
-        const { data: profile, error: readErr } = await supabase
-          .from("profiles")
-          .select("id")
-          .eq("id", user.id)
-          .maybeSingle();
-
-        if (readErr) {
-          console.error("Profile read error:", readErr.message);
+        const { error: exchangeErr } =
+          await supabase.auth.exchangeCodeForSession(url);
+        if (exchangeErr) {
+          console.error("exchangeCodeForSession error:", exchangeErr.message);
+          router.replace("/signin?error=exchange_failed");
+          return;
         }
 
-        if (!profile) {
-          const { error: insertErr } = await supabase.from("profiles").insert({
-            id: user.id,
-            email: user.email,
-            chips: 500,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          });
-          if (insertErr) {
-            console.error("Profile create error:", insertErr.message);
-          }
-        }
-
-        router.replace("/game");
+        // Success — go to the app (or `next` if present)
+        const next = u.searchParams.get("next") || "/game";
+        router.replace(next);
       } catch (e: any) {
-        console.error(
-          "Unexpected error in auth callback:",
-          e?.message ?? String(e)
-        );
-        router.replace("/signin?error=unexpected");
+        console.error("callback fatal:", e?.message ?? String(e));
+        router.replace("/signin?error=callback_fatal");
       }
     };
 
-    run();
-  }, [router]);
+    if (url) run();
+  }, [url, router]);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-black to-gray-800 flex items-center justify-center">
-      <div className="text-center">
-        <LoadingSpinner />
-        <p className="text-white text-xl mt-4">Completing sign in…</p>
-      </div>
+    <div className="min-h-screen flex items-center justify-center text-white">
+      Completing sign-in…
     </div>
   );
 }

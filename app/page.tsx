@@ -18,7 +18,6 @@ import {
   drawCard,
   calculateScore,
   isBusted,
-  isBlackjack,
   determineResult,
   calculateWinnings,
   shouldDealerHit,
@@ -55,39 +54,32 @@ export default function GamePage() {
 
   useEffect(() => {
     let mounted = true;
+    let unsub: (() => void) | undefined;
 
     const load = async () => {
       setLoading(true);
       setLoadErr(null);
 
       try {
-        // ✅ 1) Check session first (does not throw if missing)
+        // 1) Check session; redirect if missing
         const {
           data: { session },
           error: sessionErr,
         } = await supabase.auth.getSession();
-
-        if (sessionErr) {
-          // Rare, but surface it
-          throw sessionErr;
-        }
+        if (sessionErr) throw sessionErr;
 
         if (!session) {
-          // Not signed in → leave protected route
           router.replace("/signin?next=/game");
           return;
         }
 
-        // Keep an eye on sign-out while user sits on this page
-        const {
-          data: { subscription },
-        } = supabase.auth.onAuthStateChange((evt) => {
-          if (evt === "SIGNED_OUT") {
-            router.replace("/signin");
-          }
+        // Watch for sign-out while on this page
+        const { data } = supabase.auth.onAuthStateChange((evt) => {
+          if (evt === "SIGNED_OUT") router.replace("/signin");
         });
+        unsub = () => data.subscription.unsubscribe();
 
-        // ✅ 2) Now safe to read user + RLS-protected data
+        // 2) Load profile chips
         const user = session.user;
         setUserId(user.id);
         setUserEmail(user.email ?? null);
@@ -104,7 +96,6 @@ export default function GamePage() {
           if (!mounted) return;
           setGameState((prev) => ({ ...prev, chips: profile.chips }));
         } else {
-          // Create a starter profile if missing
           const { error: iErr } = await supabase.from("profiles").insert({
             id: user.id,
             email: user.email,
@@ -112,15 +103,9 @@ export default function GamePage() {
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           });
-          if (iErr) {
-            setLoadErr(`Profile insert error: ${iErr.message}`);
-          }
+          if (iErr) setLoadErr(`Profile insert error: ${iErr.message}`);
         }
-
-        // Cleanup for auth listener
-        return () => subscription.unsubscribe();
       } catch (e: any) {
-        // 🩹 If we see the infamous message, treat as unauthenticated and redirect
         const msg = e?.message ?? String(e);
         if (msg.includes("Auth session missing")) {
           router.replace("/signin?next=/game");
@@ -135,8 +120,13 @@ export default function GamePage() {
     load();
     return () => {
       mounted = false;
+      if (unsub) unsub();
     };
   }, [router]);
+
+  /** -----------------------------
+   *  Game actions
+   * ----------------------------- */
 
   const handlePlaceBet = (amount: number) => {
     setGameState((prev) => ({
@@ -158,7 +148,8 @@ export default function GamePage() {
     setGameState((prev) => ({ ...prev, playerHand: newPlayerHand }));
 
     if (playerScore > 21) {
-      handleGameEnd("lose");
+      // Player busts; finish round with current dealer hand
+      handleGameEnd("lose", gameState.dealerHand);
     }
   };
 
@@ -189,10 +180,16 @@ export default function GamePage() {
     result: "win" | "lose" | "push",
     finalDealerHand?: number[]
   ) => {
-    const dealerHandToUse = finalDealerHand || gameState.dealerHand;
-    const winnings = calculateWinnings(result, gameState.betAmount);
-    const newChips = gameState.chips - gameState.betAmount + winnings;
+    const dealerHandToUse = finalDealerHand ?? gameState.dealerHand;
 
+    // Totals & payouts
+    const player_total = calculateScore(gameState.playerHand);
+    const dealer_total = calculateScore(dealerHandToUse);
+    const winnings = calculateWinnings(result, gameState.betAmount);
+    const delta = winnings - gameState.betAmount; // win:+bet, lose:-bet, push:0
+    const newChips = gameState.chips + delta;
+
+    // Update UI state
     setGameState((prev) => ({
       ...prev,
       dealerHand: dealerHandToUse,
@@ -202,17 +199,19 @@ export default function GamePage() {
       isDealerTurn: false,
     }));
 
+    // Persist to DB
     if (userId) {
       try {
         await createGame({
           bet_amount: gameState.betAmount,
           player_hand: gameState.playerHand,
           dealer_hand: dealerHandToUse,
-          player_total: calculateScore(gameState.playerHand),
-          dealer_total: calculateScore(dealerHandToUse),
+          player_total,
+          dealer_total,
+          delta, // ✅ required by createGame
           result,
           winnings,
-        });
+        } as any);
 
         await updateUserChips(userId, newChips);
       } catch (e) {
@@ -232,6 +231,10 @@ export default function GamePage() {
       isDealerTurn: false,
     }));
   };
+
+  /** -----------------------------
+   *  Rendering
+   * ----------------------------- */
 
   if (loading) {
     return (
@@ -258,10 +261,7 @@ export default function GamePage() {
     );
   }
 
-  const playerScore = calculateScore(gameState.playerHand);
-  const dealerScore = calculateScore(gameState.dealerHand);
   const playerBusted = isBusted(gameState.playerHand);
-  const dealerBusted = isBusted(gameState.dealerHand);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-black to-gray-800">
@@ -308,7 +308,6 @@ export default function GamePage() {
                   <Button
                     onClick={async () => {
                       await supabase.auth.signOut();
-                      // leave protected route immediately
                       router.replace("/signin");
                     }}
                     variant="ghost"
@@ -324,6 +323,7 @@ export default function GamePage() {
         </div>
       </div>
 
+      {/* Main */}
       <div className="max-w-6xl mx-auto px-4 py-8">
         <div className="text-center mb-8">
           <h1 className="text-4xl font-bold text-white mb-2">Blackjack</h1>
@@ -340,7 +340,7 @@ export default function GamePage() {
               <Hand
                 cards={gameState.dealerHand}
                 title="Dealer"
-                isDealer={true}
+                isDealer
                 showScore={
                   gameState.gamePhase === "finished" || gameState.isDealerTurn
                 }
@@ -390,11 +390,7 @@ export default function GamePage() {
 
             {/* Player Hand */}
             <Card className="bg-gray-800 border-gray-700">
-              <Hand
-                cards={gameState.playerHand}
-                title="Your Hand"
-                showScore={true}
-              />
+              <Hand cards={gameState.playerHand} title="Your Hand" showScore />
             </Card>
 
             {/* Action Buttons */}
@@ -424,7 +420,6 @@ export default function GamePage() {
 
           {/* Sidebar */}
           <div className="space-y-6">
-            {/* Betting Interface */}
             {gameState.gamePhase === "betting" && (
               <BettingInterface
                 currentChips={gameState.chips}
@@ -432,7 +427,6 @@ export default function GamePage() {
               />
             )}
 
-            {/* AI Advice */}
             {gameState.gamePhase === "playing" &&
               gameState.playerHand.length > 0 &&
               gameState.dealerHand.length > 0 && (
@@ -442,7 +436,6 @@ export default function GamePage() {
                 />
               )}
 
-            {/* Game Info */}
             <Card className="bg-gray-800 border-gray-700 p-6">
               <h3 className="font-semibold text-white mb-4">Game Rules</h3>
               <div className="space-y-2 text-sm text-gray-300">

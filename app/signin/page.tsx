@@ -7,7 +7,7 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { LogIn, Shield, Brain, Trophy, Zap } from "lucide-react";
 import Link from "next/link";
-import { supabase } from "@/lib/supabase";
+import { supabase, ensureProfile } from "@/lib/supabase";
 import { useRouter } from "next/navigation";
 
 export default function SignInPage() {
@@ -16,13 +16,26 @@ export default function SignInPage() {
   const router = useRouter();
 
   useEffect(() => {
-    checkUserAndProfile();
+    const check = async () => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (user) {
+        await ensureProfile(); // self-heal if profile missing
+        router.push("/game");
+      } else {
+        setUser(null);
+      }
+    };
+
+    check();
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
+    } = supabase.auth.onAuthStateChange(async (_event, session) => {
       if (session?.user) {
-        checkUserAndProfile();
+        await ensureProfile();
+        router.push("/game");
       } else {
         setUser(null);
       }
@@ -30,42 +43,6 @@ export default function SignInPage() {
 
     return () => subscription.unsubscribe();
   }, [router]);
-
-  const checkUserAndProfile = async () => {
-    try {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-      if (!user) {
-        setUser(null);
-        return;
-      }
-
-      const { data: profile, error: profileError } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", user.id)
-        .maybeSingle(); // <- avoids throwing when not found
-
-      if (!profile) {
-        const { error: insertError } = await supabase.from("profiles").insert({
-          id: user.id,
-          email: user.email,
-          chips: 500,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        });
-        if (insertError)
-          console.error("Error creating profile:", insertError.message);
-      }
-
-      setUser(user);
-      router.push("/game");
-    } catch (e) {
-      console.error("Error checking user and profile:", e);
-      setUser(null);
-    }
-  };
 
   const handleGoogleSignIn = async () => {
     setIsLoading(true);
@@ -79,7 +56,6 @@ export default function SignInPage() {
       if (error) throw error;
     } catch (error) {
       console.error("Error signing in:", error);
-    } finally {
       setIsLoading(false);
     }
   };
@@ -201,23 +177,21 @@ export default function SignInPage() {
             </div>
 
             <div className="space-y-6">
-              {features.map((feature, index) => (
+              {features.map((f, i) => (
                 <motion.div
-                  key={index}
+                  key={i}
                   initial={{ opacity: 0, y: 20 }}
                   animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.5, delay: 0.3 + index * 0.1 }}
+                  transition={{ duration: 0.5, delay: 0.3 + i * 0.1 }}
                 >
                   <Card className="bg-gray-800 border-gray-700 p-6 hover:bg-gray-700 transition-all duration-300">
                     <div className="flex items-start space-x-4">
-                      <div className="text-yellow-400 mt-1">{feature.icon}</div>
+                      <div className="text-yellow-400 mt-1">{f.icon}</div>
                       <div>
                         <h3 className="font-semibold text-white mb-2">
-                          {feature.title}
+                          {f.title}
                         </h3>
-                        <p className="text-sm text-gray-300">
-                          {feature.description}
-                        </p>
+                        <p className="text-sm text-gray-300">{f.description}</p>
                       </div>
                     </div>
                   </Card>
