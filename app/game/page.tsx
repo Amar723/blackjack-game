@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 export const dynamic = "force-dynamic";
 
 import { motion, AnimatePresence } from "framer-motion";
@@ -10,12 +9,12 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Play, Home, History } from "lucide-react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 import Hand from "@/components/Hand";
 import BettingInterface from "@/components/BettingInterface";
 import AIAdvice from "@/components/AIAdvice";
 import {
-  drawCard,
   calculateScore,
   isBusted,
   isBlackjack,
@@ -23,7 +22,9 @@ import {
   calculateWinnings,
   shouldDealerHit,
 } from "@/lib/game-logic";
+import { dealInitialHands, drawFromDeck, Deck } from "@/lib/deck";
 import { supabase, updateUserChips, createGame } from "@/lib/supabase";
+import AuthGuard from "@/components/AuthGuard";
 
 interface GameState {
   playerHand: number[];
@@ -33,11 +34,12 @@ interface GameState {
   result: "win" | "lose" | "push" | null;
   chips: number;
   isDealerTurn: boolean;
+  // track remaining deck so draws are without replacement
+  deck?: Deck;
 }
 
-export default function GamePage() {
+function GameContent() {
   const router = useRouter();
-
   const [gameState, setGameState] = useState<GameState>({
     playerHand: [],
     dealerHand: [],
@@ -54,108 +56,122 @@ export default function GamePage() {
   const [loadErr, setLoadErr] = useState<string | null>(null);
 
   useEffect(() => {
-    let mounted = true;
-
     const load = async () => {
       setLoading(true);
       setLoadErr(null);
 
       try {
-        // ✅ 1) Check session first (does not throw if missing)
-        const {
-          data: { session },
-          error: sessionErr,
-        } = await supabase.auth.getSession();
+        // Add timeout to prevent infinite loading
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Load timeout after 10s")), 10000)
+        );
 
-        if (sessionErr) {
-          // Rare, but surface it
-          throw sessionErr;
-        }
+        const loadPromise = (async () => {
+          console.log("🔍 Getting user...");
+          const {
+            data: { user },
+            error,
+          } = await supabase.auth.getUser();
 
-        if (!session) {
-          // Not signed in → leave protected route
-          router.replace("/signin?next=/game");
-          return;
-        }
-
-        // Keep an eye on sign-out while user sits on this page
-        const {
-          data: { subscription },
-        } = supabase.auth.onAuthStateChange((evt) => {
-          if (evt === "SIGNED_OUT") {
-            router.replace("/signin");
-          }
-        });
-
-        // ✅ 2) Now safe to read user + RLS-protected data
-        const user = session.user;
-        setUserId(user.id);
-        setUserEmail(user.email ?? null);
-
-        const { data: profile, error: pErr } = await supabase
-          .from("profiles")
-          .select("chips")
-          .eq("id", user.id)
-          .maybeSingle();
-
-        if (pErr) {
-          setLoadErr(`Profile read error: ${pErr.message}`);
-        } else if (profile?.chips != null) {
-          if (!mounted) return;
-          setGameState((prev) => ({ ...prev, chips: profile.chips }));
-        } else {
-          // Create a starter profile if missing
-          const { error: iErr } = await supabase.from("profiles").insert({
-            id: user.id,
-            email: user.email,
-            chips: 500,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
+          console.log("👤 User result:", {
+            user: user?.id,
+            error: error?.message,
           });
-          if (iErr) {
-            setLoadErr(`Profile insert error: ${iErr.message}`);
-          }
-        }
 
-        // Cleanup for auth listener
-        return () => subscription.unsubscribe();
+          if (error) throw error;
+
+          if (!user) {
+            console.log("No user found, should redirect");
+            setLoading(false);
+            return;
+          }
+
+          setUserId(user.id);
+          setUserEmail(user.email ?? null);
+
+          console.log("📊 Fetching profile for user:", user.id);
+
+          // Try to read chips
+          const { data: profile, error: pErr } = await supabase
+            .from("profiles")
+            .select("chips")
+            .eq("id", user.id)
+            .maybeSingle();
+
+          console.log("💰 Profile result:", {
+            chips: profile?.chips,
+            error: pErr?.message,
+          });
+
+          if (pErr) {
+            console.error("profiles read error:", pErr.message);
+            setLoadErr(`Profile read error: ${pErr.message}`);
+          } else if (profile?.chips != null) {
+            setGameState((prev) => ({ ...prev, chips: profile.chips }));
+          } else {
+            console.log("🆕 Creating new profile...");
+            // create missing profile
+            const { error: iErr } = await supabase.from("profiles").insert({
+              id: user.id,
+              email: user.email,
+              chips: 500,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            });
+            if (iErr) {
+              console.error("profiles insert error:", iErr.message);
+              setLoadErr(`Profile insert error: ${iErr.message}`);
+            } else {
+              console.log("Profile created successfully");
+            }
+          }
+        })();
+
+        await Promise.race([loadPromise, timeoutPromise]);
+        console.log("✅ Load complete");
       } catch (e: any) {
-        // 🩹 If we see the infamous message, treat as unauthenticated and redirect
-        const msg = e?.message ?? String(e);
-        if (msg.includes("Auth session missing")) {
-          router.replace("/signin?next=/game");
-          return;
-        }
-        setLoadErr(msg);
+        console.error("Error in load:", e?.message ?? String(e));
+        setLoadErr(e?.message ?? String(e));
       } finally {
-        if (mounted) setLoading(false);
+        console.log("🏁 Setting loading to false");
+        setLoading(false);
       }
     };
 
     load();
-    return () => {
-      mounted = false;
-    };
-  }, [router]);
+  }, []);
 
   const handlePlaceBet = (amount: number) => {
+    // Use deck utility to deal initial hands without replacement
+    const { deck, playerHand, dealerHand } = dealInitialHands();
     setGameState((prev) => ({
       ...prev,
       betAmount: amount,
       gamePhase: "playing",
-      playerHand: [drawCard(), drawCard()],
-      dealerHand: [drawCard()],
+      playerHand: playerHand as number[],
+      dealerHand: dealerHand as number[],
+      deck,
     }));
   };
 
   const handleHit = () => {
     if (gameState.gamePhase !== "playing") return;
 
-    const newCard = drawCard();
-    const newPlayerHand = [...gameState.playerHand, newCard];
+    const { card, deck: newDeck } = drawFromDeck(gameState.deck ?? []);
+    if (!card) {
+      // Deck exhausted — optional: reshuffle. For now, warn and no-op.
+      console.warn("Deck exhausted on hit");
+      return;
+    }
+
+    const newPlayerHand = [...gameState.playerHand, card];
     const playerScore = calculateScore(newPlayerHand);
 
-    setGameState((prev) => ({ ...prev, playerHand: newPlayerHand }));
+    setGameState((prev) => ({
+      ...prev,
+      playerHand: newPlayerHand,
+      deck: newDeck,
+    }));
 
     if (playerScore > 21) {
       handleGameEnd("lose");
@@ -174,28 +190,30 @@ export default function GamePage() {
 
   const dealerPlay = async () => {
     let dealerHand = [...gameState.dealerHand];
+    let currentDeck = gameState.deck ?? [];
 
     while (shouldDealerHit(dealerHand)) {
       await new Promise((r) => setTimeout(r, 600));
-      dealerHand = [...dealerHand, drawCard()];
-      setGameState((prev) => ({ ...prev, dealerHand }));
+      const { card, deck: newDeck } = drawFromDeck(currentDeck);
+      if (!card) {
+        console.warn("Deck exhausted during dealer play");
+        break;
+      }
+      dealerHand = [...dealerHand, card];
+      currentDeck = newDeck;
+      setGameState((prev) => ({ ...prev, dealerHand, deck: currentDeck }));
     }
 
     const result = determineResult(gameState.playerHand, dealerHand);
-    handleGameEnd(result, dealerHand);
+    handleGameEnd(result);
   };
 
-  const handleGameEnd = async (
-    result: "win" | "lose" | "push",
-    finalDealerHand?: number[]
-  ) => {
-    const dealerHandToUse = finalDealerHand || gameState.dealerHand;
+  const handleGameEnd = async (result: "win" | "lose" | "push") => {
     const winnings = calculateWinnings(result, gameState.betAmount);
     const newChips = gameState.chips - gameState.betAmount + winnings;
 
     setGameState((prev) => ({
       ...prev,
-      dealerHand: dealerHandToUse,
       result,
       gamePhase: "finished",
       chips: newChips,
@@ -207,12 +225,11 @@ export default function GamePage() {
         await createGame({
           bet_amount: gameState.betAmount,
           player_hand: gameState.playerHand,
-          dealer_hand: dealerHandToUse,
-          player_total: calculateScore(gameState.playerHand),
-          dealer_total: calculateScore(dealerHandToUse),
+          dealer_hand: gameState.dealerHand,
           result,
           winnings,
-        });
+          user_id: "" as any,
+        } as any);
 
         await updateUserChips(userId, newChips);
       } catch (e) {
@@ -232,6 +249,8 @@ export default function GamePage() {
       isDealerTurn: false,
     }));
   };
+
+  console.log("🎮 Render state:", { loading, loadErr, userId });
 
   if (loading) {
     return (
@@ -307,8 +326,8 @@ export default function GamePage() {
                   </Badge>
                   <Button
                     onClick={async () => {
+                      // Sign out and send user to the signin page.
                       await supabase.auth.signOut();
-                      // leave protected route immediately
                       router.replace("/signin");
                     }}
                     variant="ghost"
@@ -434,8 +453,7 @@ export default function GamePage() {
 
             {/* AI Advice */}
             {gameState.gamePhase === "playing" &&
-              gameState.playerHand.length > 0 &&
-              gameState.dealerHand.length > 0 && (
+              gameState.playerHand.length > 0 && (
                 <AIAdvice
                   playerHand={gameState.playerHand}
                   dealerCard={gameState.dealerHand[0]}
@@ -457,5 +475,16 @@ export default function GamePage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function GamePage() {
+  // Wrap the actual game content in the client-side AuthGuard so that
+  // unauthorized users are redirected to /signin before the page tries
+  // to read RLS-protected data.
+  return (
+    <AuthGuard>
+      <GameContent />
+    </AuthGuard>
   );
 }
